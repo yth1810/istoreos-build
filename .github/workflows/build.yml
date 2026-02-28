@@ -10,6 +10,8 @@ jobs:
     # 增大构建虚拟机的资源（编译OpenWrt类固件需要更多内存）
     env:
       DEBIAN_FRONTEND: noninteractive
+      # 定义源码目录常量，统一管理
+      SRC_DIR: ${{ github.workspace }}/istoreos
     steps:
       # 1. 检出仓库（必填）
       - name: Checkout
@@ -18,47 +20,67 @@ jobs:
       # 2. 优化系统环境（增加交换空间，防止内存不足）
       - name: Optimize System
         run: |
-          # 创建4GB交换文件，避免编译时内存不足
-          sudo fallocate -l 4G /swapfile
+          # 增加交换空间到8GB（4GB可能不足）
+          sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1G count=8
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile
           sudo swapon /swapfile
+          # 关闭swapiness，优先使用物理内存
+          sudo sysctl vm.swappiness=10
           # 显示系统资源信息，便于排查问题
           free -h
           df -h
+          # 升级内核相关依赖，避免编译兼容问题
+          sudo apt install -y linux-headers-$(uname -r)
 
       # 3. 安装编译依赖（补充完整依赖）
       - name: Install Dependencies
         run: |
-          sudo apt update -y
-          sudo apt full-upgrade -y
+          sudo apt update -y && sudo apt full-upgrade -y
+          # 补充遗漏的编译依赖（如git-lfs、xz-utils）
           sudo apt install -y build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
-          gettext git libncurses-dev libssl-dev python3-distutils rsync unzip zlib1g-dev file wget \
+          gettext git git-lfs libncurses-dev libssl-dev python3-distutils rsync unzip zlib1g-dev file wget \
           libelf-dev libffi-dev python3-pip python3-setuptools python3-yaml time qemu-utils \
           device-tree-compiler patch libgmp3-dev libmpc-dev libmpfr-dev autoconf automake libtool \
-          autopoint texinfo sharutils bzip2 lzma liblzma-dev libacl1-dev libattr1-dev
-          sudo apt autoremove -y
-          sudo apt clean -y
+          autopoint texinfo sharutils bzip2 lzma liblzma-dev libacl1-dev libattr1-dev xz-utils
+          sudo apt autoremove -y && sudo apt clean -y
+          # 安装python依赖
+          pip3 install --upgrade pip setuptools
 
-      # 4. 克隆 iStoreOS 官方源码（指定稳定分支）
+      # 4. 克隆 iStoreOS 官方源码（指定稳定分支，添加重试+超时）
       - name: Clone Source Code
+        id: clone
+        # 添加超时和重试机制
+        timeout-minutes: 30
         run: |
-          git clone --depth=1 --single-branch --branch main https://github.com/istoreos/istoreos.git
-          cd istoreos
-          # 显示源码版本信息
+          # 克隆前先删除旧目录（防止残留）
+          rm -rf ${{ env.SRC_DIR }}
+          # 克隆源码，添加重试和深度优化
+          git clone --depth=1 --single-branch --branch main https://github.com/istoreos/istoreos.git ${{ env.SRC_DIR }} || \
+          (sleep 10 && git clone --depth=1 --single-branch --branch main https://github.com/istoreos/istoreos.git ${{ env.SRC_DIR }})
+          # 进入目录并记录版本
+          cd ${{ env.SRC_DIR }}
           git rev-parse --short HEAD > version.txt
+          # 验证目录是否存在（关键：提前终止错误）
+          if [ ! -d "${{ env.SRC_DIR }}" ]; then
+            echo "源码克隆失败，istoreos目录不存在！"
+            exit 1
+          fi
 
-      # 5. 更新并安装插件源（添加超时处理）
+      # 5. 更新并安装插件源（添加超时处理+重试）
       - name: Update Feeds
+        # 依赖克隆步骤成功才执行
+        needs: [clone]
         run: |
-          cd istoreos
-          ./scripts/feeds update -a || (sleep 30 && ./scripts/feeds update -a)
-          ./scripts/feeds install -a
+          cd ${{ env.SRC_DIR }}
+          # 增加超时和重试，设置网络超时参数
+          ./scripts/feeds update -a -f || (sleep 30 && ./scripts/feeds update -a -f)
+          ./scripts/feeds install -a -f
 
       # 6. 核心配置（目标+根目录+EXT4+UEFI+Docker+Cgroup）
       - name: Configure Firmware
         run: |
-          cd istoreos
+          cd ${{ env.SRC_DIR }}
           # 先加载默认配置
           make defconfig
           # 基础目标配置（x86_64通用版）
@@ -82,54 +104,72 @@ jobs:
           echo "CONFIG_PACKAGE_kmod-docker=y" >> .config
           echo "CONFIG_PACKAGE_containerd=y" >> .config
           echo "CONFIG_PACKAGE_runc=y" >> .config
-          # 5. 保留你需要的IPTables Cgroup组件
+          # 5. 保留IPTables Cgroup组件
           echo "CONFIG_kmod-ipt-cgroup=y" >> .config
           echo "CONFIG_iptables-mod-cgroup=y" >> .config
           echo "CONFIG_NETFILTER_XT_MATCH_CGROUP=y" >> .config
-          # 禁用不必要的调试选项，加速编译
+          # 禁用调试+优化编译
           echo "CONFIG_DEBUG=n" >> .config
           echo "CONFIG_STRIP_STRIP_ALL=y" >> .config
+          # 验证配置文件
+          if [ ! -f .config ]; then
+            echo "配置文件生成失败！"
+            exit 1
+          fi
 
       # 7. 生成最终配置并验证
       - name: Make Defconfig
         run: |
-          cd istoreos
+          cd ${{ env.SRC_DIR }}
           make defconfig
           # 导出配置文件，便于排查问题
           cat .config > config_final.txt
 
-      # 8. 下载依赖包（加速编译，添加重试）
+      # 8. 下载依赖包（加速编译，添加重试+超时）
       - name: Download Packages
+        timeout-minutes: 60
         run: |
-          cd istoreos
+          cd ${{ env.SRC_DIR }}
+          # 先设置网络超时
+          export DOWNLOAD_TIMEOUT=300
           make download -j$(nproc) || make download -j1 V=s
 
-      # 9. 开始编译固件（限制并发数，避免编译错误）
+      # 9. 开始编译固件（更保守的并发数，避免内存溢出）
       - name: Build Firmware
+        timeout-minutes: 180
         run: |
-          cd istoreos
-          # 限制编译并发数为CPU核心数-1，减少内存占用
-          make -j$((`nproc`-1)) V=s || make -j1 V=s
+          cd ${{ env.SRC_DIR }}
+          # 更保守的并发数：CPU核心数/2（GitHub Actions默认2核，实际用1核）
+          CORES=$(( (`nproc` + 1) / 2 ))
+          echo "使用 $CORES 核心编译"
+          make -j$CORES V=s || make -j1 V=s
 
-      # 10. 列出编译结果（便于调试）
+      # 10. 列出编译结果（增加容错，目录不存在时不报错）
       - name: List Build Results
         if: always()
         run: |
-          cd istoreos
-          ls -lh bin/targets/x86/64/
-          # 生成已安装包列表
-          ./scripts/diffconfig.sh > selected_packages.txt
+          # 先检查目录是否存在
+          if [ -d "${{ env.SRC_DIR }}/bin/targets/x86/64/" ]; then
+            cd ${{ env.SRC_DIR }}
+            ls -lh bin/targets/x86/64/
+            ./scripts/diffconfig.sh > selected_packages.txt
+          else
+            echo "编译结果目录不存在，跳过列示"
+            touch selected_packages.txt # 创建空文件避免上传失败
+          fi
 
-      # 11. 上传编译结果（包含固件+清单+配置文件）
+      # 11. 上传编译结果（包含容错，文件不存在时不报错）
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
+        # 即使编译失败也上传日志/配置，便于排查
+        if: always()
         with:
           name: iStoreOS-x86_64-Cgroup-Docker-2048MB
           path: |
-            istoreos/bin/targets/x86/64/*.img.gz
-            istoreos/bin/targets/x86/64/*.manifest
-            istoreos/config_final.txt
-            istoreos/version.txt
-            selected_packages.txt
+            ${{ env.SRC_DIR }}/bin/targets/x86/64/*.img.gz
+            ${{ env.SRC_DIR }}/bin/targets/x86/64/*.manifest
+            ${{ env.SRC_DIR }}/config_final.txt
+            ${{ env.SRC_DIR }}/version.txt
+            ${{ env.SRC_DIR }}/selected_packages.txt
           # 保留artifact 30天
           retention-days: 30
