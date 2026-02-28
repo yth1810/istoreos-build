@@ -7,33 +7,60 @@ on:
 jobs:
   build-firmware:
     runs-on: ubuntu-22.04
+    # 增大构建虚拟机的资源（编译OpenWrt类固件需要更多内存）
+    env:
+      DEBIAN_FRONTEND: noninteractive
     steps:
       # 1. 检出仓库（必填）
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 2. 安装编译依赖
+      # 2. 优化系统环境（增加交换空间，防止内存不足）
+      - name: Optimize System
+        run: |
+          # 创建4GB交换文件，避免编译时内存不足
+          sudo fallocate -l 4G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          # 显示系统资源信息，便于排查问题
+          free -h
+          df -h
+
+      # 3. 安装编译依赖（补充完整依赖）
       - name: Install Dependencies
         run: |
-          sudo apt update
+          sudo apt update -y
+          sudo apt full-upgrade -y
           sudo apt install -y build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
-          gettext git libncurses-dev libssl-dev python3-distutils rsync unzip zlib1g-dev file wget
+          gettext git libncurses-dev libssl-dev python3-distutils rsync unzip zlib1g-dev file wget \
+          libelf-dev libffi-dev python3-pip python3-setuptools python3-yaml time qemu-utils \
+          device-tree-compiler patch libgmp3-dev libmpc-dev libmpfr-dev autoconf automake libtool \
+          autopoint texinfo sharutils bzip2 lzma liblzma-dev libacl1-dev libattr1-dev
+          sudo apt autoremove -y
+          sudo apt clean -y
 
-      # 3. 克隆 iStoreOS 官方源码
+      # 4. 克隆 iStoreOS 官方源码（指定稳定分支）
       - name: Clone Source Code
-        run: git clone --depth=1 https://github.com/istoreos/istoreos.git
+        run: |
+          git clone --depth=1 --single-branch --branch main https://github.com/istoreos/istoreos.git
+          cd istoreos
+          # 显示源码版本信息
+          git rev-parse --short HEAD > version.txt
 
-      # 4. 更新并安装插件源
+      # 5. 更新并安装插件源（添加超时处理）
       - name: Update Feeds
         run: |
           cd istoreos
-          ./scripts/feeds update -a
+          ./scripts/feeds update -a || (sleep 30 && ./scripts/feeds update -a)
           ./scripts/feeds install -a
 
-      # 5. 核心配置（目标+根目录+EXT4+UEFI+Docker+Cgroup）
+      # 6. 核心配置（目标+根目录+EXT4+UEFI+Docker+Cgroup）
       - name: Configure Firmware
         run: |
           cd istoreos
+          # 先加载默认配置
+          make defconfig
           # 基础目标配置（x86_64通用版）
           echo "CONFIG_TARGET_x86=y" >> .config
           echo "CONFIG_TARGET_x86_64=y" >> .config
@@ -59,26 +86,41 @@ jobs:
           echo "CONFIG_kmod-ipt-cgroup=y" >> .config
           echo "CONFIG_iptables-mod-cgroup=y" >> .config
           echo "CONFIG_NETFILTER_XT_MATCH_CGROUP=y" >> .config
+          # 禁用不必要的调试选项，加速编译
+          echo "CONFIG_DEBUG=n" >> .config
+          echo "CONFIG_STRIP_STRIP_ALL=y" >> .config
 
-      # 6. 生成最终配置
+      # 7. 生成最终配置并验证
       - name: Make Defconfig
         run: |
           cd istoreos
           make defconfig
+          # 导出配置文件，便于排查问题
+          cat .config > config_final.txt
 
-      # 7. 下载依赖包（加速编译）
+      # 8. 下载依赖包（加速编译，添加重试）
       - name: Download Packages
         run: |
           cd istoreos
-          make download -j$(nproc)
+          make download -j$(nproc) || make download -j1 V=s
 
-      # 8. 开始编译固件
+      # 9. 开始编译固件（限制并发数，避免编译错误）
       - name: Build Firmware
         run: |
           cd istoreos
-          make -j$(nproc) V=s
+          # 限制编译并发数为CPU核心数-1，减少内存占用
+          make -j$((`nproc`-1)) V=s || make -j1 V=s
 
-      # 9. 上传编译结果（包含固件+清单）
+      # 10. 列出编译结果（便于调试）
+      - name: List Build Results
+        if: always()
+        run: |
+          cd istoreos
+          ls -lh bin/targets/x86/64/
+          # 生成已安装包列表
+          ./scripts/diffconfig.sh > selected_packages.txt
+
+      # 11. 上传编译结果（包含固件+清单+配置文件）
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -86,4 +128,8 @@ jobs:
           path: |
             istoreos/bin/targets/x86/64/*.img.gz
             istoreos/bin/targets/x86/64/*.manifest
+            istoreos/config_final.txt
+            istoreos/version.txt
             selected_packages.txt
+          # 保留artifact 30天
+          retention-days: 30
