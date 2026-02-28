@@ -30,58 +30,60 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      # 5. 配置编译目标（x86_64 通用版）
-      - name: Configure Target
+      # 5. 核心配置（目标+根目录+EXT4+UEFI+Docker+Cgroup）
+      - name: Configure Firmware
         run: |
           cd istoreos
+          # 基础目标配置（x86_64通用版）
           echo "CONFIG_TARGET_x86=y" >> .config
           echo "CONFIG_TARGET_x86_64=y" >> .config
           echo "CONFIG_TARGET_x86_64_DEVICE_generic=y" >> .config
           echo "CONFIG_LUCI_LANG_zh_Hans=y" >> .config
 
-      # 6. 启用 IPTables Cgroup 组件（核心配置）
-      - name: Enable IPTables Cgroup
-        run: |
-          cd istoreos
+          # 1. 设置根目录大小为2048MB（2GB）
+          echo "CONFIG_TARGET_ROOTFS_PARTSIZE=2048" >> .config
+          # 2. 启用EXT4文件系统支持
+          echo "CONFIG_TARGET_ROOTFS_EXT4FS=y" >> .config
+          echo "CONFIG_PACKAGE_kmod-fs-ext4=y" >> .config
+          # 3. 启用UEFI启动支持
+          echo "CONFIG_EFI_IMAGES=y" >> .config
+          echo "CONFIG_PACKAGE_grub2-efi=y" >> .config
+          echo "CONFIG_PACKAGE_efibootmgr=y" >> .config
+          # 4. 预装Docker及依赖（完整Docker环境）
+          echo "CONFIG_PACKAGE_docker=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-docker=y" >> .config
+          echo "CONFIG_PACKAGE_kmod-docker=y" >> .config
+          echo "CONFIG_PACKAGE_containerd=y" >> .config
+          echo "CONFIG_PACKAGE_runc=y" >> .config
+          # 5. 保留你需要的IPTables Cgroup组件
           echo "CONFIG_kmod-ipt-cgroup=y" >> .config
           echo "CONFIG_iptables-mod-cgroup=y" >> .config
           echo "CONFIG_NETFILTER_XT_MATCH_CGROUP=y" >> .config
 
-      # 7. 生成最终配置
+      # 6. 生成最终配置
       - name: Make Defconfig
         run: |
           cd istoreos
           make defconfig
 
-      # 8. 导出完整配置文件（新增：方便查看所有选中的组件）
-      - name: Export Full Config
-        run: |
-          cd istoreos
-          # 把完整的.config文件复制到易访问的目录
-          cp .config ../full_config.txt
-          # 筛选出所有选中的包（组件/插件），生成简化清单
-          grep -E "CONFIG_PACKAGE_|CONFIG_KERNEL_|CONFIG_LUCI_" .config | grep -v "#" > ../selected_packages.txt
-
-      # 9. 下载依赖包（加速编译）
+      # 7. 下载依赖包（加速编译）
       - name: Download Packages
         run: |
           cd istoreos
           make download -j$(nproc)
 
-      # 10. 开始编译固件
+      # 8. 开始编译固件
       - name: Build Firmware
         run: |
           cd istoreos
           make -j$(nproc) V=s
 
-      # 11. 上传编译结果（包含固件、配置文件、清单文件）
+      # 9. 上传编译结果（包含固件+清单）
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: iStoreOS-x86_64-Cgroup
-          # 同时上传固件、完整配置、选中包清单、manifest文件
+          name: iStoreOS-x86_64-Cgroup-Docker-2048MB
           path: |
             istoreos/bin/targets/x86/64/*.img.gz
             istoreos/bin/targets/x86/64/*.manifest
-            full_config.txt
             selected_packages.txt
