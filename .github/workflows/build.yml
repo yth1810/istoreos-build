@@ -53,21 +53,35 @@ jobs:
           cd istoreos
           make defconfig
 
-      # 8. 下载依赖包（加速编译）
+      # 8. 导出完整配置文件（新增：方便查看所有选中的组件）
+      - name: Export Full Config
+        run: |
+          cd istoreos
+          # 把完整的.config文件复制到易访问的目录
+          cp .config ../full_config.txt
+          # 筛选出所有选中的包（组件/插件），生成简化清单
+          grep -E "CONFIG_PACKAGE_|CONFIG_KERNEL_|CONFIG_LUCI_" .config | grep -v "#" > ../selected_packages.txt
+
+      # 9. 下载依赖包（加速编译）
       - name: Download Packages
         run: |
           cd istoreos
           make download -j$(nproc)
 
-      # 9. 开始编译固件
+      # 10. 开始编译固件
       - name: Build Firmware
         run: |
           cd istoreos
           make -j$(nproc) V=s
 
-      # 10. 上传编译结果（下载用）
+      # 11. 上传编译结果（包含固件、配置文件、清单文件）
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: iStoreOS-x86_64-Cgroup
-          path: istoreos/bin/targets/x86/64/*.img.gz
+          # 同时上传固件、完整配置、选中包清单、manifest文件
+          path: |
+            istoreos/bin/targets/x86/64/*.img.gz
+            istoreos/bin/targets/x86/64/*.manifest
+            full_config.txt
+            selected_packages.txt
